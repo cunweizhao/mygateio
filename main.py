@@ -172,6 +172,123 @@ def fetch_candles_window(symbol: str, interval: str, from_ts: int, to_ts: int) -
 
 # ------------------------- 策略逻辑 -------------------------
 
+# ======== 1分钟方向预测（零依赖简化版） ========
+# 思路：对最近一小段价格做线性回归取斜率（Slope），结合最近收益的Z分数（MomentumZ）、
+# EMA快慢线的距离（EMAGap）以及RSI斜率（RSI Drift），做一个加权投票，输出未来 ~60 秒
+# 上/下/震荡 的概率与方向。这里是“**短时趋势判断**”，不是价格点位预测。
+#
+# 可调参数：
+#   horizon_secs: 预测未来的秒数（默认 60s）
+#   lookback_mult: 回看窗口大约是 horizon 的倍数（默认 5 倍）
+#   up_thr / dn_thr: 概率阈值（默认 0.55 / 0.45）
+
+class ForecastParams:
+    def __init__(self, horizon_secs:int = 60, lookback_mult:float = 5.0,
+                 up_thr:float = 0.55, dn_thr:float = 0.45):
+        self.horizon_secs = horizon_secs
+        self.lookback_mult = lookback_mult
+        self.up_thr = up_thr
+        self.dn_thr = dn_thr
+
+
+def _ols_slope_tstat(y: List[float]) -> Tuple[float, float]:
+    """对等间隔时间序列 y 做一元线性回归，返回 (斜率, t统计量)。"""
+    n = len(y)
+    if n < 3:
+        return 0.0, 0.0
+    x_mean = (n-1)/2.0
+    y_mean = sum(y)/n
+    num = 0.0
+    den = 0.0
+    for i in range(n):
+        dx = i - x_mean
+        num += dx * (y[i] - y_mean)
+        den += dx * dx
+    slope = num / (den + 1e-12)
+    # 残差方差
+    ss = 0.0
+    for i in range(n):
+        y_hat = y_mean + slope * (i - x_mean)
+        ss += (y[i] - y_hat) ** 2
+    sigma2 = ss / max(1, n - 2)
+    se = math.sqrt(sigma2 / (den + 1e-12))
+    t = slope / (se + 1e-12)
+    return slope, t
+
+
+def _zscore_last(series: List[float], lb: int) -> float:
+    if len(series) < lb:
+        return 0.0
+    window = series[-lb:]
+    mean = sum(window)/lb
+    var = sum((x-mean)**2 for x in window)/max(1, lb-1)
+    std = math.sqrt(max(var,1e-12))
+    return (series[-1]-mean)/(std+1e-12)
+
+
+def forecast_direction_1m(candles: List[Dict], sec_per_bar: int, fp: ForecastParams) -> Dict:
+    if not candles:
+        return {"dir": "flat", "prob_up": 0.5, "prob_dn": 0.5, "explain": "无数据"}
+    # 只用已收盘K线
+    if not candles[-1].get("finished", True):
+        candles = candles[:-1]
+    close = [c["close"] for c in candles]
+    rsi14 = rsi(close, 14)
+    # 回看窗口按 horizon 的倍数取
+    horizon_bars = max(1, int(round(fp.horizon_secs / max(1, sec_per_bar))))
+    lookback = max(5, int(round(horizon_bars * fp.lookback_mult)))
+    tail = close[-lookback:]
+    # 1) 斜率 + t 值
+    slope, tstat = _ols_slope_tstat(tail)
+    # 2) 近K收益 z 分数
+    rets = [0.0]
+    for i in range(1, len(close)):
+        rets.append((close[i]-close[i-1])/(close[i-1]+1e-12))
+    z_mo = _zscore_last(rets, min(len(rets), max(5, lookback//2)))
+    # 3) EMA Gap
+    ema_f = ema(close, 9)
+    ema_s = ema(close, 21)
+    emagap = (ema_f[-1] - ema_s[-1])/(close[-1]+1e-12)
+    # 4) RSI Drift（最近若干根的斜率）
+    rsi_tail = rsi14[-min(lookback, len(rsi14)) : ]
+    _, rsi_t = _ols_slope_tstat(rsi_tail)
+
+    # 将各分量映射到 0-1 概率（sigmoid），进行加权
+    def sigmoid(x):
+        return 1.0/(1.0+math.exp(-x))
+    p_slope = sigmoid(tstat)
+    p_momo  = sigmoid(2.5*z_mo)
+    p_gap   = sigmoid(30*emagap)
+    p_rsi   = sigmoid(rsi_t/2.0)
+
+    # 权重：斜率 0.4，动量 0.3，EMA 0.2，RSI 0.1
+    w1,w2,w3,w4 = 0.4,0.3,0.2,0.1
+    prob_up = max(0.0, min(1.0, w1*p_slope + w2*p_momo + w3*p_gap + w4*p_rsi))
+    prob_dn = 1.0 - prob_up
+
+    if prob_up >= fp.up_thr:
+        d = "up"
+    elif prob_dn >= (1.0 - fp.dn_thr):
+        d = "down"
+    else:
+        d = "flat"
+
+    return {
+        "dir": d,
+        "prob_up": prob_up,
+        "prob_dn": prob_dn,
+        "meta": {
+            "horizon_secs": fp.horizon_secs,
+            "lookback": lookback,
+            "tstat": tstat,
+            "z_momentum": z_mo,
+            "ema_gap": emagap,
+            "rsi_t": rsi_t
+        },
+        "explain": f"Slope-t={tstat:.2f}, Z={z_mo:.2f}, EMAGap={emagap:.4f}, RSI-t={rsi_t:.2f}"
+    }
+
+
 class Params:
     def __init__(self, ema_fast=9, ema_slow=21, breakout=10, vol_window=20, vol_thr=1.2,
                  z_lookback=12, z_thr=1.8, atr_period=14, atr_mult=0.6, hold_secs=120,
@@ -375,6 +492,32 @@ def backtest(candles: List[Dict], p: Params, sec_per_bar: int, fee_bp: float = 5
 # ------------------------- 实盘循环 -------------------------
 
 def live_loop(symbol: str, interval: str, poll: int, window_min: int, p: Params):
+    sec_per_bar = interval_to_seconds(interval)
+    fp = ForecastParams(horizon_secs=60, lookback_mult=5.0, up_thr=0.55, dn_thr=0.45)
+    print(f"[LIVE] {symbol} interval={interval} poll={poll}s window={window_min}m mode={p.mode} hold={p.hold_secs}s")
+    while True:
+        try:
+            to_ts = int(time.time()) - 3
+            from_ts = to_ts - window_min * 60
+            candles = fetch_candles_window(symbol, interval, from_ts, to_ts)
+            if not candles:
+                print(f"[{datetime.now()}] 无数据")
+            else:
+                sig = decide_action(candles, p, sec_per_bar)
+                ex = sig["extras"]
+                fc = forecast_direction_1m(candles, sec_per_bar, fp)
+                print(
+                    f"[{datetime.now()}] {symbol} => {sig['action']} | {sig['reason']} | "
+                    f"P={ex['price']:.2f} EMA{p.ema_fast}/{p.ema_slow}={ex['ema_fast']:.2f}/{ex['ema_slow']:.2f} "
+                    f"RSI14={ex['rsi14']:.1f} ATR={ex['atr']:.2f} Z={ex['zscore_last']:.2f} "
+                    f"VR={ex['vratio'] if ex['vratio']==ex['vratio'] else float('nan'):.2f} | "
+                    f"[1m预测] {fc['dir']}  up={fc['prob_up']:.2%} dn={fc['prob_dn']:.2%}  ({fc['explain']})"
+                )
+        except Exception as e:
+            print(f"异常: {type(e).__name__}: {e}")
+        finally:
+            time.sleep(max(1, poll))
+
     sec_per_bar = interval_to_seconds(interval)
     print(f"[LIVE] {symbol} interval={interval} poll={poll}s window={window_min}m mode={p.mode} hold={p.hold_secs}s")
     while True:
