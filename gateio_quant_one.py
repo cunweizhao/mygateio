@@ -116,8 +116,10 @@ def fetch_candles_window(symbol:str, interval:str, t_from:int, t_to:int) -> List
     # 防止过大窗口导致长时间请求
     hard_cap = 200000  # 最多抓20万根
     fetched = 0
+    # Gate: 最多允许距今 10000 根以前的数据窗口。将起点钳制到这个范围内。
+    cur = max(cur, t_to - sec_bar*9999)
     while cur < t_to and fetched < hard_cap:
-        part=fetch_candles(symbol, interval, cur, min(t_to, cur+sec_bar*1000))
+        part=fetch_candles(symbol, interval, cur, min(t_to, cur+sec_bar*999))
         if not part: break
         out.extend(part)
         fetched += len(part)
